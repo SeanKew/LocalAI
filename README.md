@@ -2,12 +2,32 @@
 
 Starter project for on-device Qwen2.5-1.5B-Instruct inference using Alibaba MNN, Kotlin, JNI, and C++17. Target ABI: arm64-v8a.
 
-Status: scaffold setup in progress. This repository does not contain compiled MNN shared libraries or model weights, and an Android build/device inference has not yet been verified.
+## Native dependency setup
 
-See the official MNN Android example: https://github.com/alibaba/MNN/tree/master/apps/Android/MnnLlmChat
+Run PowerShell from the repository root:
 
-Model export documentation: https://github.com/alibaba/MNN/tree/master/transformers/llm/export
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\fetch_mnn_deps.ps1
+```
 
-Build MNN for Android arm64-v8a with LLM enabled. Copy matching libMNN.so, libllm.so and any dependent shared libraries to app/src/main/jniLibs/arm64-v8a/. Copy matching headers to app/src/main/cpp/include, including llm/llm.hpp and its dependencies. Never mix headers and libraries from different MNN revisions.
+The script downloads the arm64-v8a `libMNN.so` from the official MNNChat Android APK and prepares the matching public MNN header layout under `app/src/main/cpp/include/`. MNNChat's Android package bundles the LLM runtime into `libMNN.so`; it does not use a separate `libllm.so`. The script reports the source URLs and fails rather than silently leaving incomplete dependencies.
 
-Place exported model files at context.getExternalFilesDir(null)/models/qwen2.5-1.5b-mnn/; config.json is expected. A 1.5B 4-bit model may require substantial memory. The stop method must be treated as a cancellation request until a version-specific incremental generation loop is implemented and tested.
+Verify the dependency provenance/version before shipping. The binary is a prebuilt from MNNChat and should be treated as a versioned native dependency. The script does not download model weights.
+
+Directory map:
+- `app/src/main/cpp/`: JNI bridge, CMake, `include/`, optional `lib/`
+- `app/src/main/jniLibs/arm64-v8a/`: tracked ARM64 shared libraries
+- `app/src/main/java/com/seankew/localai/MnnLlm.kt`: Kotlin wrapper
+
+## Model
+
+Place exported model files at `context.getExternalFilesDir(null)/models/qwen2.5-1.5b-mnn/`; `config.json` is expected. Model weights are intentionally not committed. A 1.5B quantized model can still require substantial memory.
+
+## Status and limitations
+
+This scaffold has not yet been built with Android SDK/NDK or tested on a device. The native stop method is only a cancellation request until a version-specific incremental generation loop is implemented and tested; native release must also be synchronized with active inference.
+
+References:
+- Official MNN repository: https://github.com/alibaba/MNN
+- Official Android LLM chat app: https://github.com/alibaba/MNN/tree/master/apps/Android/MnnLlmChat
+- LLM export docs: https://github.com/alibaba/MNN/tree/master/transformers/llm/export
