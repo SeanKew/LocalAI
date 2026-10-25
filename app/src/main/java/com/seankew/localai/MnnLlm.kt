@@ -21,8 +21,8 @@ fun interface TokenCallback {
 class MnnLlm(private val context: Context) : AutoCloseable {
     companion object {
         init {
+            // MNNChat's Android prebuilt contains the LLM runtime in libMNN.so.
             System.loadLibrary("MNN")
-            System.loadLibrary("llm")
             System.loadLibrary("mnnllm_jni")
         }
     }
