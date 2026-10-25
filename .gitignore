@@ -1,0 +1,16 @@
+# Android/Gradle build output
+.gradle/
+**/build/
+local.properties
+.idea/
+*.iml
+
+# Local model weights and exported model folders (large; keep out of Git)
+app/src/main/assets/models/
+app/src/main/models/
+models/
+
+# Native binaries are intentionally NOT ignored.
+# Keep required, versioned Android runtime libraries under:
+# app/src/main/jniLibs/arm64-v8a/*.so
+# Do not add a global *.so rule here.
