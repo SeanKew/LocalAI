@@ -17,5 +17,6 @@ add_library(MNN SHARED IMPORTED)
 set_target_properties(MNN PROPERTIES IMPORTED_LOCATION "${MNN_LIB_DIR}/libMNN.so")
 
 add_library(mnnllm_jni SHARED llm_jni.cpp)
+target_compile_options(mnnllm_jni PRIVATE -fexceptions -frtti -fvisibility=hidden -Wall)
 target_include_directories(mnnllm_jni PRIVATE "${MNN_INCLUDE_DIR}")
 target_link_libraries(mnnllm_jni PRIVATE MNN log android)
