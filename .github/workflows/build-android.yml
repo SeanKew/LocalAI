@@ -43,7 +43,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null
+          # android-actions/setup-android has already accepted the SDK licenses.
           sdkmanager --install \
             "platform-tools" \
             "platforms;android-35" \
