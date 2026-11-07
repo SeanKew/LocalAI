@@ -29,6 +29,7 @@ class MainActivity : Activity() {
     private lateinit var fileStatusView: TextView
     private lateinit var eventStatusView: TextView
     private lateinit var outputView: TextView
+    private lateinit var outputScroll: ScrollView
     private lateinit var promptInput: EditText
     private lateinit var importButton: Button
     private lateinit var initButton: Button
@@ -67,6 +68,13 @@ class MainActivity : Activity() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(18), dp(18), dp(18), dp(18))
+        }
+        val pageScroll = ScrollView(this).apply {
+            isFillViewport = true
+            addView(root, ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
         }
 
         root.addView(TextView(this).apply {
@@ -163,12 +171,19 @@ class MainActivity : Activity() {
             setTextIsSelectable(true)
             setPadding(dp(10), dp(10), dp(10), dp(10))
         }
-        val outputScroll = ScrollView(this).apply { addView(outputView) }
+        outputScroll = ScrollView(this).apply {
+            isFillViewport = false
+            isNestedScrollingEnabled = false
+            addView(outputView, ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+        }
         root.addView(outputScroll, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(260)
         ))
 
-        setContentView(root)
+        setContentView(pageScroll)
     }
 
     private fun refreshModelStatus() {
@@ -345,6 +360,7 @@ class MainActivity : Activity() {
             try {
                 engine.chat(prompt, maxNewTokens = 256).collect { piece ->
                     outputView.append(piece)
+                    outputScroll.post { outputScroll.fullScroll(ScrollView.FOCUS_DOWN) }
                 }
                 appendEvent("生成结束：${engine.lastFinishReason ?: "未知原因"}")
             } catch (cancelled: CancellationException) {
