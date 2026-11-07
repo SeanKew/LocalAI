@@ -3,6 +3,8 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 android {
+    // Keep Gradle's Android toolchain aligned with the NDK used to build MNN in CI.
+    ndkVersion = "27.2.12479018"
     namespace = "com.seankew.localai"
     compileSdk = 35
     defaultConfig {
