@@ -317,7 +317,15 @@ class MainActivity : Activity() {
         val engine = MnnLlm(applicationContext)
         llm = engine
         uiScope.launch {
-            val result = engine.init(modelDir = modelDir, threads = 4, backend = "cpu", precision = "low")
+            val result = engine.init(
+                modelDir = modelDir,
+                threads = 4,
+                backend = "cpu",
+                precision = "low",
+                maxNewTokens = LlmDefaults.MAX_NEW_TOKENS,
+                maxAllTokens = LlmDefaults.MAX_ALL_TOKENS,
+                systemPrompt = AdvisorPrompt.DEFAULT
+            )
             result.fold(
                 onSuccess = {
                     appendEvent("✓ 模型初始化成功。现在可以输入问题并点击“发送”。")
@@ -358,7 +366,7 @@ class MainActivity : Activity() {
         appendEvent("开始生成……")
         uiScope.launch {
             try {
-                engine.chat(prompt, maxNewTokens = 256).collect { piece ->
+                engine.chat(prompt).collect { piece ->
                     outputView.append(piece)
                     outputScroll.post { outputScroll.fullScroll(ScrollView.FOCUS_DOWN) }
                 }

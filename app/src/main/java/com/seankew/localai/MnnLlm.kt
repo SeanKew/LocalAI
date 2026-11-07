@@ -40,6 +40,7 @@ class MnnLlm(private val context: Context) : AutoCloseable {
     val isLoaded: Boolean get() = isReady
 
     @Volatile private var handle = 0L          // native 注册表 id，不是指针
+    @Volatile private var defaultMaxNewTokens = LlmDefaults.MAX_NEW_TOKENS
     @Volatile private var activeGen = 0L
     @Volatile private var activeCancel: AtomicBoolean? = null
     private val genCounter = AtomicLong(0)
@@ -60,7 +61,12 @@ class MnnLlm(private val context: Context) : AutoCloseable {
         threads: Int = 4,
         backend: String = "cpu",
         precision: String = "low",
+        maxNewTokens: Int = LlmDefaults.MAX_NEW_TOKENS,
+        maxAllTokens: Int = LlmDefaults.MAX_ALL_TOKENS,
+        systemPrompt: String? = AdvisorPrompt.DEFAULT,
     ): Result<Unit> {
+        require(maxNewTokens > 0) { "maxNewTokens must be > 0" }
+        require(maxAllTokens >= maxNewTokens) { "maxAllTokens must be >= maxNewTokens" }
         while (true) {
             val cur = state.get()
             if (cur != State.NEW && cur != State.FAILED)
@@ -86,8 +92,14 @@ class MnnLlm(private val context: Context) : AutoCloseable {
                     .put("thread_num", threads)
                     .put("backend_type", backend)
                     .put("precision", precision)
+                    .put("max_new_tokens", maxNewTokens)
+                    .put("max_all_tokens", maxAllTokens)
+                    .apply {
+                        if (!systemPrompt.isNullOrBlank()) put("system_prompt", systemPrompt)
+                    }
                     .toString()
                 MnnNative.nativeLoad(h, extra)
+                defaultMaxNewTokens = maxNewTokens
 
                 if (!state.compareAndSet(State.INITIALIZING, State.READY))
                     throw MnnException("released during init", ErrorCode.BAD_STATE)
@@ -113,7 +125,7 @@ class MnnLlm(private val context: Context) : AutoCloseable {
      * 同一时刻只允许一次生成；状态不是 READY 时 Flow 以 IllegalStateException 结束。
      * 取消收集（或调用 stop()）会真正中断 native 推理，通常在下一个 token 内生效。
      */
-    fun chat(prompt: String, maxNewTokens: Int = 512): Flow<String> = callbackFlow {
+    fun chat(prompt: String, maxNewTokens: Int = defaultMaxNewTokens): Flow<String> = callbackFlow {
         require(maxNewTokens > 0) { "maxNewTokens must be > 0" }
         if (!state.compareAndSet(State.READY, State.GENERATING)) {
             close(IllegalStateException("MnnLlm is ${state.get()}; chat() requires READY"))
