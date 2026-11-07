@@ -107,7 +107,7 @@ class MnnLlm(private val context: Context) : AutoCloseable {
                     .toString()
                 MnnNative.nativeLoad(h, extra)
                 defaultMaxNewTokens = maxNewTokens
-                this.systemPrompt = systemPrompt
+                this@MnnLlm.systemPrompt = systemPrompt
 
                 if (!state.compareAndSet(State.INITIALIZING, State.READY))
                     throw MnnException("released during init", ErrorCode.BAD_STATE)
