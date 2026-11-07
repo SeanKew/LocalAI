@@ -25,6 +25,7 @@
 #include <type_traits>
 #include <typeinfo>
 #include <unordered_map>
+#include <vector>
 
 #include <MNN/MNNDefine.h>
 #include "llm/llm.hpp"
@@ -37,7 +38,13 @@ static constexpr const char* kCallbackClass  = "com/seankew/localai/TokenCallbac
 
 // 生成结束标记：由 MNN 在正常结束时写入输出流，我们在流里识别并剥掉
 static constexpr const char* kEndMarker = "<eop>";
-// 生成被中断/达到上限后，KV cache 里的历史不完整（缺少 end-of-turn），默认直接 reset 以免污染下一轮
+// 除 MNN 的 end marker 外，也识别 Qwen ChatML / EOS 的可见形式。
+static constexpr const char* kStopMarkers[] = {
+    kEndMarker, "<|im_end|>", "<|endoftext|>", "<|im_start|>"
+};
+// Kotlin 传入完整 ChatML；C++ 只编码 token，不再让 MNN 二次套用 prompt template。
+static constexpr bool kPromptIsFinal = true;
+// 生成被中断/达到上限后，KV cache 里的历史不完整，默认 reset 以免污染下一轮。
 static constexpr bool kResetOnAbnormalEnd = true;
 
 // =============================== 日志 ===============================
@@ -144,9 +151,22 @@ template <class T> bool callLoad(T& l, long) { l.load(); return true; }
 template <class T> auto callSetConfig(T& l, const std::string& c, int) -> decltype(static_cast<bool>(l.set_config(c))) { return static_cast<bool>(l.set_config(c)); }
 template <class T> bool callSetConfig(T& l, const std::string& c, long) { l.set_config(c); return true; }
 
-// prefill + 生成第 1 个 token；输出写入 os，正常结束时会追加 endMark
+// MNN 3.6.2 的 tokenizer_encode(string) 直接分词，不调用 apply_chat_template。
+inline std::vector<int> encode(Llm& l, const std::string& prompt) {
+    return l.tokenizer_encode(prompt);
+}
+// 将已经编码的完整 ChatML token 序列交给 MNN，不触发 string response 的二次模板处理。
+inline void startFromIds(Llm& l, const std::vector<int>& ids, std::ostream* os, const char* endMark) {
+    l.response(ids, os, endMark, 1);
+}
+// 旧行为保留为显式回退选项。
 inline void startAndFirstToken(Llm& l, const std::string& prompt, std::ostream* os, const char* endMark) {
     l.response(prompt, os, endMark, 1);
+}
+// MNN 3.6.2 暴露 current_token；在每次增量生成后读取最新 token id。
+inline int lastTokenId(Llm& l) {
+    const auto* ctx = l.getContext();
+    return ctx ? static_cast<int>(ctx->current_token) : -1;
 }
 // 再生成 1 个 token
 inline void step(Llm& l) { l.generate(1); }
@@ -164,6 +184,11 @@ struct LlmHandle {
     std::atomic<bool> stop_requested{false};     // 请求中断当前推理
     std::atomic<bool> released{false};           // 已进入释放流程，任何新操作都应拒绝
     std::atomic<uint64_t> active_gen{0};         // 正在运行的那一代；0 = 空闲
+    int imStartId = -1, imEndId = -1, eotId = -1; // load 时验证并缓存 Qwen2.5 ChatML token id
+
+    bool isStopId(int token) const {
+        return token >= 0 && (token == imEndId || token == eotId);
+    }
 
     bool shouldStop() const {
         return stop_requested.load(std::memory_order_acquire) ||
@@ -222,12 +247,57 @@ static size_t utf8SafeLen(const std::string& s, size_t limit) {
     }
     return limit;   // 连续 4 个 continuation：数据已损坏，原样放行
 }
-// 末尾若是 "<eop>" 的前缀（如 "<e"），先扣住，等下一块数据再判断
+// 返回最早出现的停止标记位置；which 返回对应标记。
+static size_t findStopMarker(const std::string& s, const char** which) {
+    size_t best = std::string::npos;
+    for (const char* marker : kStopMarkers) {
+        const size_t pos = s.find(marker);
+        if (pos < best) {
+            best = pos;
+            if (which) *which = marker;
+        }
+    }
+    return best;
+}
+
+// 末尾若是任一停止标记的前缀（如 "<|im_e"），先扣住，等下一块数据再判断。
 static size_t partialMarkerSuffix(const std::string& s) {
-    const size_t mlen = std::strlen(kEndMarker);
-    for (size_t k = std::min(mlen - 1, s.size()); k > 0; --k)
-        if (s.compare(s.size() - k, k, kEndMarker, k) == 0) return k;
-    return 0;
+    size_t best = 0;
+    for (const char* marker : kStopMarkers) {
+        const size_t markerLen = std::strlen(marker);
+        for (size_t k = std::min(markerLen - 1, s.size()); k > best; --k) {
+            if (s.compare(s.size() - k, k, marker, k) == 0) {
+                best = k;
+                break;
+            }
+        }
+    }
+    return best;
+}
+
+// 启动自检：Qwen2.5 的三个核心 ChatML token 必须分别编码为预期的单个 token id。
+static void probeChatMl(LlmHandle& h) {
+    auto one = [&](const char* marker, int expectedId) -> int {
+        const std::vector<int> ids = llm_api::encode(*h.llm, marker);
+        const int actualId = ids.size() == 1 ? ids[0] : -1;
+        LOGI("  probe encode(%s) -> %zu id(s), actual=%d expected=%d%s",
+             marker, ids.size(), actualId, expectedId,
+             (actualId == expectedId) ? "" : "  <-- mismatch");
+        return actualId == expectedId ? actualId : -1;
+    };
+
+    LOGI("ChatML tokenizer self-check (Qwen2.5 expects im_start=151644, im_end=151645, endoftext=151643)");
+    h.imStartId = one("<|im_start|>", 151644);
+    h.imEndId   = one("<|im_end|>", 151645);
+    h.eotId     = one("<|endoftext|>", 151643);
+    LOGI("  ids: im_start=%d im_end=%d endoftext=%d", h.imStartId, h.imEndId, h.eotId);
+
+    if (h.imStartId < 0 || h.imEndId < 0 || h.eotId < 0) {
+        throw MnnError(ERR_LOAD,
+            "tokenizer ChatML self-check failed: expected Qwen2.5 ids "
+            "<|im_start|>=151644, <|im_end|>=151645, <|endoftext|>=151643; "
+            "check tokenizer.txt and MNN logs");
+    }
 }
 
 // 模型目录预检：把"文件缺失 / 推送不完整"这类最常见的初始化失败在进入 MNN 之前就说清楚
@@ -284,7 +354,8 @@ public:
     TokenSink(JNIEnv* env, jobject cb, LlmHandle& h)
         : env_(env), cb_(cb), h_(h), owner_(std::this_thread::get_id()) {}
 
-    bool sawEndMarker()  const { return eop_; }
+    bool sawStop() const { return eop_; }
+    const char* stopMarker() const { return stopMarker_ ? stopMarker_ : ""; }
     bool callbackFailed() const { return cbFailed_; }
     void finish() { drain(true); }
 
@@ -311,9 +382,15 @@ private:
     void drain(bool final) {
         if (dead_) { pending_.clear(); return; }
         size_t limit = pending_.size();
-        const size_t pos = pending_.find(kEndMarker);
-        if (pos != std::string::npos) { limit = pos; eop_ = true; }
-        else if (!final) { limit -= partialMarkerSuffix(pending_); }
+        const char* which = nullptr;
+        const size_t pos = findStopMarker(pending_, &which);
+        if (pos != std::string::npos) {
+            limit = pos;
+            eop_ = true;
+            stopMarker_ = which;
+        } else if (!final) {
+            limit -= partialMarkerSuffix(pending_);
+        }
         limit = utf8SafeLen(pending_, limit);
         if (limit > 0) emit(pending_.data(), limit);
         if (eop_ || final) pending_.clear(); else pending_.erase(0, limit);
@@ -344,6 +421,7 @@ private:
     JNIEnv* env_; jobject cb_; LlmHandle& h_;
     std::thread::id owner_;
     std::string pending_;
+    const char* stopMarker_ = nullptr;
     bool eop_ = false, dead_ = false, cbFailed_ = false;
 };
 
@@ -381,6 +459,7 @@ static void JNICALL nativeLoad(JNIEnv* env, jclass, jlong id, jstring jExtraConf
             throw MnnError(ERR_LOAD, "set_config() rejected the config: " + cfg);
         if (!llm_api::callLoad(*h->llm, 0))
             throw MnnError(ERR_LOAD, "Llm::load() returned false (see MNNJNI / MNN logs: backend init, weight file, OOM)");
+        if (kPromptIsFinal) probeChatMl(*h);
         h->loaded = true;
         LOGI("load ok (%lld ms)", msSince(t0));
     });
@@ -392,7 +471,7 @@ static jint JNICALL nativeGenerate(JNIEnv* env, jclass, jlong id, jlong gen,
         if (!jPrompt || !cb)    throw MnnError(ERR_BAD_ARGUMENT, "prompt/callback is null");
         if (maxNewTokens <= 0)  throw MnnError(ERR_BAD_ARGUMENT, "maxNewTokens must be > 0");
 
-        auto h = requireHandle(id);   // shared_ptr：即使 release 并发发生，对象在本次调用结束前不会被销毁
+        auto h = requireHandle(id);
         std::unique_lock<std::mutex> lk(h->mu, std::try_to_lock);
         if (!lk.owns_lock())
             throw MnnError(ERR_BAD_STATE, "handle is busy (another load/generate/reset/release is running)");
@@ -400,26 +479,64 @@ static jint JNICALL nativeGenerate(JNIEnv* env, jclass, jlong id, jlong gen,
         if (!h->loaded)         throw MnnError(ERR_BAD_STATE, "model not loaded");
 
         const std::string prompt = bytesToString(env, jPrompt);
-        // 顺序重要：先清 stop，再公布 active_gen；之后到达的 nativeStop(gen) 才会生效
         h->stop_requested.store(false, std::memory_order_release);
         h->active_gen.store(static_cast<uint64_t>(gen), std::memory_order_release);
         struct GenGuard { LlmHandle& h; ~GenGuard() { h.active_gen.store(0, std::memory_order_release); } } guard{*h};
 
-        LOGI("generate: gen=%lld prompt=%zu bytes max_new_tokens=%d", (long long)gen, prompt.size(), (int)maxNewTokens);
+        std::vector<int> ids;
+        if (kPromptIsFinal) {
+            // Kotlin 构建完整 ChatML，每轮从空 KV 开始，避免残留模型上下文与应用历史不一致。
+            llm_api::reset(*h->llm);
+            ids = llm_api::encode(*h->llm, prompt);
+            if (ids.empty()) throw MnnError(ERR_BAD_ARGUMENT, "prompt tokenized to 0 ids");
+
+            LOGI("generate: gen=%lld prompt=%zu bytes -> %zu tokens (first=%d last=%d) max_new=%d",
+                 (long long)gen, prompt.size(), ids.size(), ids.front(), ids.back(), (int)maxNewTokens);
+            // Debug build only: expose the initial prompt structure for ChatML diagnostics.
+            LOGD("prompt dump:\n%s", prompt.substr(0, 1200).c_str());
+        } else {
+            LOGI("generate: gen=%lld prompt=%zu bytes max_new=%d",
+                 (long long)gen, prompt.size(), (int)maxNewTokens);
+        }
+
         const auto t0 = Clock::now();
         TokenSink sink(env, cb, *h);
         std::ostream os(&sink);
         int produced = 0;
         jint reason = REASON_EOS;
+        std::string stopCause;
+
+        // 四层结束判断：可见停止标记、MNN stoped()、最新 token id、max_new_tokens 兜底。
+        auto checkEos = [&]() -> bool {
+            if (sink.sawStop()) {
+                stopCause = std::string("text marker ") + sink.stopMarker();
+                return true;
+            }
+            if (llm_api::finished(*h->llm)) {
+                stopCause = "MNN stoped()";
+                return true;
+            }
+            const int token = llm_api::lastTokenId(*h->llm);
+            if (h->isStopId(token)) {
+                stopCause = "token id " + std::to_string(token);
+                return true;
+            }
+            return false;
+        };
 
         try {
-            llm_api::startAndFirstToken(*h->llm, prompt, &os, kEndMarker);   // prefill + 第 1 个 token
+            if (kPromptIsFinal) {
+                llm_api::startFromIds(*h->llm, ids, &os, kEndMarker);
+            } else {
+                llm_api::startAndFirstToken(*h->llm, prompt, &os, kEndMarker);
+            }
             produced = 1;
+
             for (;;) {
-                if (h->shouldStop())                                        { reason = REASON_STOPPED;    break; }
-                if (sink.sawEndMarker() || llm_api::finished(*h->llm))      { reason = REASON_EOS;        break; }
-                if (produced >= maxNewTokens)                               { reason = REASON_MAX_TOKENS; break; }
-                llm_api::step(*h->llm);                                     // 每个 token 之后都回到这里检查 stop
+                if (h->shouldStop())          { reason = REASON_STOPPED;    break; }
+                if (checkEos())               { reason = REASON_EOS;        break; }
+                if (produced >= maxNewTokens) { reason = REASON_MAX_TOKENS; break; }
+                llm_api::step(*h->llm);
                 ++produced;
             }
             os.flush();
@@ -431,6 +548,12 @@ static jint JNICALL nativeGenerate(JNIEnv* env, jclass, jlong id, jlong gen,
         }
 
         const long long ms = msSince(t0);
+        if (reason == REASON_EOS) {
+            LOGI("EOS detected by [%s] after %d tokens", stopCause.c_str(), produced);
+        } else if (reason == REASON_MAX_TOKENS) {
+            LOGW("hit max_new_tokens=%d with NO stop signal from any layer: model did not emit a recognized stop token",
+                 (int)maxNewTokens);
+        }
         LOGI("generate end: reason=%d tokens=%d time=%lldms (%.1f tok/s)", (int)reason, produced, ms,
              ms > 0 ? produced * 1000.0 / (double)ms : 0.0);
 
@@ -439,7 +562,6 @@ static jint JNICALL nativeGenerate(JNIEnv* env, jclass, jlong id, jlong gen,
         return reason;
     });
 }
-
 // 不取 mu（生成期间 mu 被占用），只翻原子标志；对已释放句柄幂等
 static void JNICALL nativeStop(JNIEnv* env, jclass, jlong id, jlong gen) {
     safeCall(env, "nativeStop", [&] {

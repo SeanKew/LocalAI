@@ -45,6 +45,16 @@ class MnnLlm(private val context: Context) : AutoCloseable {
     @Volatile private var activeCancel: AtomicBoolean? = null
     private val genCounter = AtomicLong(0)
 
+    // ---- 对话历史仅在 llmScope 的单线程 dispatcher 上读写 ----
+    private val history = ArrayList<ChatTurn>()
+    @Volatile private var systemPrompt: String? = AdvisorPrompt.DEFAULT
+    @Volatile var maxHistoryChars: Int = 3000
+
+    /** 运行时切换系统提示词，下一轮对话开始时生效；传 null 可关闭。 */
+    fun setSystemPrompt(text: String?) {
+        systemPrompt = text
+    }
+
     @Volatile var lastFinishReason: FinishReason? = null
         private set
 
@@ -94,12 +104,10 @@ class MnnLlm(private val context: Context) : AutoCloseable {
                     .put("precision", precision)
                     .put("max_new_tokens", maxNewTokens)
                     .put("max_all_tokens", maxAllTokens)
-                    .apply {
-                        if (!systemPrompt.isNullOrBlank()) put("system_prompt", systemPrompt)
-                    }
                     .toString()
                 MnnNative.nativeLoad(h, extra)
                 defaultMaxNewTokens = maxNewTokens
+                this.systemPrompt = systemPrompt
 
                 if (!state.compareAndSet(State.INITIALIZING, State.READY))
                     throw MnnException("released during init", ErrorCode.BAD_STATE)
@@ -125,23 +133,29 @@ class MnnLlm(private val context: Context) : AutoCloseable {
      * 同一时刻只允许一次生成；状态不是 READY 时 Flow 以 IllegalStateException 结束。
      * 取消收集（或调用 stop()）会真正中断 native 推理，通常在下一个 token 内生效。
      */
-    fun chat(prompt: String, maxNewTokens: Int = defaultMaxNewTokens): Flow<String> = callbackFlow {
+    fun chat(userText: String, maxNewTokens: Int = defaultMaxNewTokens): Flow<String> = callbackFlow {
         require(maxNewTokens > 0) { "maxNewTokens must be > 0" }
         if (!state.compareAndSet(State.READY, State.GENERATING)) {
             close(IllegalStateException("MnnLlm is ${state.get()}; chat() requires READY"))
             return@callbackFlow
         }
+
         val h = handle
         val gen = genCounter.incrementAndGet()
         val cancelled = AtomicBoolean(false)
         activeGen = gen
         activeCancel = cancelled
-        val promptBytes = prompt.toByteArray(Charsets.UTF_8)
+        val assistantText = StringBuilder()
 
         val cb = TokenCallback { bytes ->
             try {
-                if (cancelled.get() || state.get() != State.GENERATING) false
-                else trySend(String(bytes, Charsets.UTF_8)).isSuccess   // 通道已关闭 → false → native 停止
+                if (cancelled.get() || state.get() != State.GENERATING) {
+                    false
+                } else {
+                    val piece = String(bytes, Charsets.UTF_8)
+                    assistantText.append(piece)
+                    trySend(piece).isSuccess
+                }
             } catch (t: Throwable) {
                 Log.e(TAG, "token callback failed", t)
                 false
@@ -151,26 +165,32 @@ class MnnLlm(private val context: Context) : AutoCloseable {
         llmScope.launch {
             var failure: Throwable? = null
             try {
-                // 排队期间如果已被取消/正在释放，直接跳过 native 调用
                 if (cancelled.get() || state.get() != State.GENERATING) {
                     lastFinishReason = FinishReason.STOPPED
                 } else {
-                    val code = MnnNative.nativeGenerate(h, gen, promptBytes, maxNewTokens, cb)
+                    trimHistory()
+                    val prompt = ChatMl.build(systemPrompt, history, userText)
+                    Log.i(TAG, "chat: gen=$gen promptChars=${prompt.length} historyTurns=${history.size}")
+
+                    val code = MnnNative.nativeGenerate(
+                        h, gen, prompt.toByteArray(Charsets.UTF_8), maxNewTokens, cb
+                    )
                     lastFinishReason = when (code) {
                         0 -> FinishReason.EOS
                         1 -> FinishReason.STOPPED
                         else -> FinishReason.MAX_TOKENS
                     }
-                    Log.i(TAG, "generate finished: gen=$gen reason=$lastFinishReason")
+                    commitTurn(userText, assistantText.toString())
+                    Log.i(TAG, "generate finished: gen=$gen reason=$lastFinishReason answerChars=${assistantText.length}")
                 }
             } catch (e: MnnException) {
-                Log.e(TAG, "generate failed: ${e.message}", e); failure = e
+                Log.e(TAG, "generate failed: ${e.message}", e)
+                failure = e
             } catch (t: Throwable) {
                 Log.e(TAG, "generate crashed: ${t.message}", t)
                 failure = MnnException("generate failed: ${t.message}", ErrorCode.NATIVE_EXCEPTION, t)
             } finally {
                 if (activeGen == gen) { activeGen = 0L; activeCancel = null }
-                // 必须先回到 READY 再 close：否则收集端收到完成信号后立刻发起下一次 chat() 会被误拒
                 state.compareAndSet(State.GENERATING, State.READY)
             }
             close(failure)
@@ -178,11 +198,9 @@ class MnnLlm(private val context: Context) : AutoCloseable {
 
         awaitClose {
             cancelled.set(true)
-            // 只对"这一代"生效：晚到的 stop 不会误杀后续生成
             runCatching { MnnNative.nativeStop(h, gen) }
         }
-    }.buffer(Channel.UNLIMITED)    // 默认缓冲区只有 64，trySend 会静默丢 token
-
+    }.buffer(Channel.UNLIMITED)
     /** 请求停止当前生成（非阻塞，线程安全）。 */
     fun stop() {
         val h = handle
@@ -203,7 +221,26 @@ class MnnLlm(private val context: Context) : AutoCloseable {
         withContext(dispatcher) {
             val s = state.get()
             check(s == State.READY || s == State.GENERATING) { "reset() not allowed in state $s" }
+            history.clear()
             MnnNative.nativeReset(handle)
+        }
+    }
+
+    // 只在 llm 线程调用。
+    private fun commitTurn(user: String, assistant: String) {
+        val answer = assistant.trim()
+        if (answer.isEmpty()) return
+        history += ChatTurn(ChatTurn.Role.USER, user)
+        history += ChatTurn(ChatTurn.Role.ASSISTANT, answer)
+    }
+
+    // 按完整 user/assistant 回合丢弃最旧历史，避免孤立角色消息。
+    private fun trimHistory() {
+        var totalChars = history.sumOf { it.content.length }
+        val budget = maxHistoryChars.coerceAtLeast(0)
+        while (history.size >= 2 && totalChars > budget) {
+            totalChars -= history.removeAt(0).content.length
+            totalChars -= history.removeAt(0).content.length
         }
     }
 
