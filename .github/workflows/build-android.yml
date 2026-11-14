@@ -1,0 +1,164 @@
+name: Android Debug Build
+
+on:
+  push:
+    branches:
+      - feat/mnn-qwen-android
+  pull_request:
+    branches:
+      - feat/mnn-qwen-android
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-debug-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android-debug:
+    name: Build Android Debug APK (arm64-v8a)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout LocalAI
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          # The action defaults to the retired SDK package named "tools".
+          # Install the current SDK packages explicitly in the next step.
+          packages: ''
+
+      - name: Install Android platform, build tools, CMake and NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          # android-actions/setup-android has already accepted the SDK licenses.
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "cmake;3.22.1" \
+            "ndk;27.2.12479018"
+
+          NDK_DIR="$ANDROID_HOME/ndk/27.2.12479018"
+          test -f "$NDK_DIR/build/cmake/android.toolchain.cmake"
+          {
+            echo "ANDROID_NDK=$NDK_DIR"
+            echo "ANDROID_NDK_HOME=$NDK_DIR"
+            echo "ANDROID_NDK_ROOT=$NDK_DIR"
+          } >> "$GITHUB_ENV"
+
+      - name: Check out the pinned MNN source
+        uses: actions/checkout@v4
+        with:
+          repository: alibaba/MNN
+          ref: "3.6.2"
+          path: third_party/MNN
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Build MNN with the LLM runtime for ARM64
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MNN_ROOT="$GITHUB_WORKSPACE/third_party/MNN"
+          MNN_BUILD_DIR="$MNN_ROOT/project/android/build_64"
+          APP_MAIN="$GITHUB_WORKSPACE/app/src/main"
+          INCLUDE_DIR="$APP_MAIN/cpp/include"
+          JNI_LIB_DIR="$APP_MAIN/jniLibs/arm64-v8a"
+
+          test -f "$MNN_ROOT/project/android/build_64.sh"
+          test -f "$MNN_ROOT/transformers/llm/engine/include/llm/llm.hpp"
+
+          # Keep the upstream Android build script, but limit parallelism for
+          # the standard GitHub-hosted Linux runner.
+          sed -i 's/^make -j4$/make -j2/' "$MNN_ROOT/project/android/build_64.sh"
+
+          mkdir -p "$MNN_BUILD_DIR"
+          cd "$MNN_BUILD_DIR"
+
+          # MNN_BUILD_LLM=ON also enables LOW_MEMORY and TRANSFORMER_FUSE.
+          # MNN_CPU_WEIGHT_DEQUANT_GEMM is intentionally omitted: it was
+          # removed from MNN 3.6.x.
+          bash ../build_64.sh \
+            -DMNN_BUILD_LLM=ON \
+            -DMNN_LLM_BUILD_DEMO=OFF \
+            -DMNN_BUILD_SHARED_LIBS=ON \
+            -DMNN_SEP_BUILD=OFF \
+            -DMNN_BUILD_DIFFUSION=OFF \
+            -DMNN_BUILD_OPENCV=OFF \
+            -DMNN_IMGCODECS=OFF \
+            -DMNN_BUILD_AUDIO=OFF \
+            -DMNN_OPENCL=OFF \
+            -DMNN_VULKAN=OFF \
+            -DMNN_BUILD_TEST=OFF \
+            -DMNN_BUILD_BENCHMARK=OFF \
+            -DMNN_BUILD_TOOLS=OFF \
+            -DMNN_ARM82=ON \
+            -DMNN_USE_LOGCAT=ON
+
+          MNN_SO="$(find "$MNN_BUILD_DIR" -type f -name 'libMNN.so' -print -quit)"
+          if [[ -z "$MNN_SO" ]]; then
+            echo "::error::MNN build completed without producing libMNN.so"
+            find "$MNN_BUILD_DIR" -maxdepth 4 -type f -name '*.so' -print
+            exit 1
+          fi
+
+          mkdir -p "$INCLUDE_DIR" "$JNI_LIB_DIR"
+          cp -a "$MNN_ROOT/include/MNN" "$INCLUDE_DIR/"
+          cp -a "$MNN_ROOT/transformers/llm/engine/include/llm" "$INCLUDE_DIR/"
+          install -m 0644 "$MNN_SO" "$JNI_LIB_DIR/libMNN.so"
+
+          test -f "$INCLUDE_DIR/MNN/MNNDefine.h"
+          test -f "$INCLUDE_DIR/llm/llm.hpp"
+          test -f "$JNI_LIB_DIR/libMNN.so"
+          readelf -h "$JNI_LIB_DIR/libMNN.so" | grep -q "AArch64"
+          nm -D "$JNI_LIB_DIR/libMNN.so" | c++filt | grep -q "MNN::Transformer::Llm::createLLM"
+
+          echo "MNN runtime and LLM headers staged for arm64-v8a:"
+          ls -lh "$JNI_LIB_DIR/libMNN.so"
+          ls "$INCLUDE_DIR/MNN/MNNDefine.h" "$INCLUDE_DIR/llm/llm.hpp"
+
+      - name: Generate Gradle wrapper (repository does not include one yet)
+        shell: bash
+        run: |
+          set -euo pipefail
+          GRADLE_VERSION="8.9"
+          GRADLE_HOME="$RUNNER_TEMP/gradle-$GRADLE_VERSION"
+
+          curl --fail --location --retry 3 \
+            "https://services.gradle.org/distributions/gradle-$GRADLE_VERSION-bin.zip" \
+            --output "$RUNNER_TEMP/gradle-$GRADLE_VERSION-bin.zip"
+          unzip -q "$RUNNER_TEMP/gradle-$GRADLE_VERSION-bin.zip" -d "$RUNNER_TEMP"
+
+          "$GRADLE_HOME/bin/gradle" wrapper \
+            --gradle-version "$GRADLE_VERSION" \
+            --distribution-type bin
+          chmod +x ./gradlew
+
+      - name: Build Debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'sdk.dir=%s\nndk.dir=%s\n' "$ANDROID_HOME" "$ANDROID_NDK" > local.properties
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload Debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalAI-Android-Debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
