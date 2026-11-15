@@ -46,7 +46,7 @@ class MnnLlm(private val context: Context) : AutoCloseable {
     private val genCounter = AtomicLong(0)
 
     // ---- 对话历史仅在 llmScope 的单线程 dispatcher 上读写 ----
-    private val history = ArrayList<ChatTurn>()
+    private val history = ChatHistory()
     @Volatile private var systemPrompt: String? = AdvisorPrompt.DEFAULT
     @Volatile var maxHistoryChars: Int = 3000
 
@@ -168,8 +168,8 @@ class MnnLlm(private val context: Context) : AutoCloseable {
                 if (cancelled.get() || state.get() != State.GENERATING) {
                     lastFinishReason = FinishReason.STOPPED
                 } else {
-                    trimHistory()
-                    val prompt = ChatMl.build(systemPrompt, history, userText)
+                    history.trim(maxHistoryChars)
+                    val prompt = ChatMl.build(systemPrompt, history.snapshot(), userText)
                     Log.i(TAG, "chat: gen=$gen promptChars=${prompt.length} historyTurns=${history.size}")
 
                     val code = MnnNative.nativeGenerate(
@@ -180,7 +180,7 @@ class MnnLlm(private val context: Context) : AutoCloseable {
                         1 -> FinishReason.STOPPED
                         else -> FinishReason.MAX_TOKENS
                     }
-                    commitTurn(userText, assistantText.toString())
+                    history.commit(userText, assistantText.toString())
                     Log.i(TAG, "generate finished: gen=$gen reason=$lastFinishReason answerChars=${assistantText.length}")
                 }
             } catch (e: MnnException) {
@@ -223,24 +223,6 @@ class MnnLlm(private val context: Context) : AutoCloseable {
             check(s == State.READY || s == State.GENERATING) { "reset() not allowed in state $s" }
             history.clear()
             MnnNative.nativeReset(handle)
-        }
-    }
-
-    // 只在 llm 线程调用。
-    private fun commitTurn(user: String, assistant: String) {
-        val answer = assistant.trim()
-        if (answer.isEmpty()) return
-        history += ChatTurn(ChatTurn.Role.USER, user)
-        history += ChatTurn(ChatTurn.Role.ASSISTANT, answer)
-    }
-
-    // 按完整 user/assistant 回合丢弃最旧历史，避免孤立角色消息。
-    private fun trimHistory() {
-        var totalChars = history.sumOf { it.content.length }
-        val budget = maxHistoryChars.coerceAtLeast(0)
-        while (history.size >= 2 && totalChars > budget) {
-            totalChars -= history.removeAt(0).content.length
-            totalChars -= history.removeAt(0).content.length
         }
     }
 

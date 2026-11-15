@@ -153,6 +153,7 @@ jobs:
         run: |
           set -euo pipefail
           printf 'sdk.dir=%s\nndk.dir=%s\n' "$ANDROID_HOME" "$ANDROID_NDK" > local.properties
+          ./gradlew testDebugUnitTest --no-daemon --stacktrace
           ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Upload Debug APK artifact
