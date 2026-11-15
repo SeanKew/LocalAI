@@ -1,6 +1,5 @@
 package com.seankew.localai
 
-import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
@@ -26,17 +25,13 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
-import androidx.documentfile.provider.DocumentFile
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.flow.collect
+import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import java.io.File
-import java.io.FileOutputStream
 
 private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
 private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
@@ -81,8 +76,21 @@ private class MaxHeightScrollView(context: Context, private val maxHeightPx: Int
     }
 }
 
-class MainActivity : Activity() {
-    private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+/** 选择文件夹：在平台的 OpenDocumentTree 基础上申请可持久化的读取授权（与原实现一致）。 */
+private class PersistableOpenDocumentTree : ActivityResultContracts.OpenDocumentTree() {
+    override fun createIntent(context: Context, input: Uri?): Intent =
+        super.createIntent(context, input).addFlags(
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+        )
+}
+
+/**
+ * 纯 UI 观察者：不持有 MnnLlm，也不管理任何模型生命周期。
+ * 所有状态来自 [ChatViewModel]；Activity 因旋转 / 深色模式切换被重建时，
+ * 只需重新构建视图并重新订阅，模型与对话都原样保留。
+ */
+class MainActivity : ComponentActivity() {
+    private val vm: ChatViewModel by viewModels()
 
     // ---- 界面状态与样式 ----
     private lateinit var p: Palette
@@ -96,11 +104,13 @@ class MainActivity : Activity() {
     private lateinit var emptyHint: TextView
     private var panelExpanded = true
     private var stickToBottom = true
+    private var lastPhase: ModelPhase? = null
 
-    // ---- 原有成员（名称不变）----
+    // 已渲染的气泡：消息 id -> TextView（按消息顺序）。用于流式输出时只追加增量文本
+    private val bubbleViews = LinkedHashMap<Long, TextView>()
+
     private lateinit var fileStatusView: TextView
     private lateinit var eventStatusView: TextView
-    private lateinit var outputView: TextView          // 现在指向"当前这条模型回答"的文本框
     private lateinit var outputScroll: ScrollView
     private lateinit var promptInput: EditText
     private lateinit var importButton: Button
@@ -109,25 +119,14 @@ class MainActivity : Activity() {
     private lateinit var stopButton: Button
     private lateinit var releaseButton: Button
 
-    private var llm: MnnLlm? = null
-    private var importing = false
-
-    private val modelDir: File
-        get() = File(getExternalFilesDir(null) ?: filesDir, "qwen2.5-1.5b-mnn")
-
-    private val requiredModelFiles = listOf(
-        "config.json",
-        "llm_config.json",
-        "llm.mnn",
-        "llm.mnn.weight",
-        "tokenizer.txt"
-    )
-
-    // These files are optional for this runtime/checklist, but are copied when present.
-    private val optionalModelFiles = listOf("llm.mnn.json", "embeddings_bf16.bin")
+    private val pickModelFolder =
+        registerForActivityResult(PersistableOpenDocumentTree()) { uri ->
+            if (uri != null) onModelFolderPicked(uri)
+        }
 
     companion object {
-        private const val REQUEST_MODEL_FOLDER = 3107
+        private const val KEY_DRAFT = "draft_text"
+        private const val KEY_PANEL = "panel_expanded"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -137,8 +136,55 @@ class MainActivity : Activity() {
         window.setBackgroundDrawable(ColorDrawable(p.bg))
         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
         buildScreen()
-        refreshModelStatus()
-        updateStatus()
+
+        // 纯界面状态（输入框草稿、面板展开）随 Activity 重建恢复；其余一切来自 ViewModel
+        if (savedInstanceState != null) {
+            promptInput.setText(savedInstanceState.getString(KEY_DRAFT).orEmpty())
+            promptInput.setSelection(promptInput.length())
+            setPanelExpanded(savedInstanceState.getBoolean(KEY_PANEL, true), animate = false)
+        }
+        observeViewModel()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putString(KEY_DRAFT, promptInput.text.toString())
+        outState.putBoolean(KEY_PANEL, panelExpanded)
+    }
+
+    // =====================================================================
+    //  订阅 ViewModel
+    // =====================================================================
+    private fun observeViewModel() {
+        lifecycleScope.launch {
+            // STARTED 以下自动停止收集；回到前台时 StateFlow 会立刻回放最新值，界面追平后台期间的进度
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                launch { vm.phase.collect { renderPhase(it) } }
+                launch { vm.messages.collect { renderMessages(it) } }
+                launch { vm.events.collect { eventStatusView.text = it.joinToString("\n") } }
+                launch { vm.modelFiles.collect { renderModelFiles(it) } }
+                launch {
+                    vm.toasts.collect { Toast.makeText(this@MainActivity, it, Toast.LENGTH_SHORT).show() }
+                }
+            }
+        }
+    }
+
+    private fun onModelFolderPicked(treeUri: Uri) {
+        runCatching {
+            contentResolver.takePersistableUriPermission(treeUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }.onFailure {
+            vm.logEvent("无法保留文件夹读取权限：${it.message}")
+        }
+        vm.importModel(treeUri)
+    }
+
+    private fun onSendClicked() {
+        if (vm.sendMessage(promptInput.text.toString())) {
+            promptInput.setText("")
+            stickToBottom = true
+            scrollToBottom()
+        }
     }
 
     // =====================================================================
@@ -199,7 +245,7 @@ class MainActivity : Activity() {
             setPadding(dp(14), dp(8), dp(14), dp(8))
             background = rounded(p.surface, 18f, p.stroke)
             isClickable = true
-            setOnClickListener { startNewChat() }
+            setOnClickListener { vm.newChat() }
         }
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -219,11 +265,11 @@ class MainActivity : Activity() {
             setTextIsSelectable(true)
             setLineSpacing(0f, 1.15f)
         }
-        importButton = pill("导入模型", filled = false).apply { setOnClickListener { chooseModelFolder() } }
-        initButton = pill("初始化", filled = true).apply { setOnClickListener { initializeModel() } }
+        importButton = pill("导入模型", filled = false).apply { setOnClickListener { pickModelFolder.launch(null) } }
+        initButton = pill("初始化", filled = true).apply { setOnClickListener { vm.initModel() } }
         releaseButton = pill("释放", filled = false).apply {
             isEnabled = false
-            setOnClickListener { releaseModel() }
+            setOnClickListener { vm.releaseModel() }
         }
         val buttonRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -315,13 +361,8 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(9), dp(8), dp(9))
         }
-        val send = fab("↑", p.accent, p.onAccent, "发送").apply { setOnClickListener { sendPrompt() } }
-        val stop = fab("■", p.text, p.bg, "停止").apply {
-            setOnClickListener {
-                llm?.stop()
-                appendEvent("已请求停止生成。")
-            }
-        }
+        val send = fab("↑", p.accent, p.onAccent, "发送").apply { setOnClickListener { onSendClicked() } }
+        val stop = fab("■", p.text, p.bg, "停止").apply { setOnClickListener { vm.stopGeneration() } }
         sendButton = send
         stopButton = stop
         // 停止按钮启用 = 正在生成：此时显示"停止"，隐藏"发送"；反之亦然
@@ -358,27 +399,92 @@ class MainActivity : Activity() {
     }
 
     // =====================================================================
-    //  界面辅助：状态灯 / 面板 / 气泡 / 滚动
+    //  渲染：把 ViewModel 的状态映射到视图
     // =====================================================================
-    private fun updateStatus() {
-        val state = llm?.currentState
-        val (color, label) = when {
-            importing -> p.busy to "正在导入模型…"
-            state == MnnLlm.State.INITIALIZING -> p.busy to "正在初始化…"
-            state == MnnLlm.State.RELEASING -> p.busy to "正在释放…"
-            state == MnnLlm.State.GENERATING -> p.ok to "生成中…"
-            state == MnnLlm.State.READY -> p.ok to "模型就绪 · 离线运行"
-            else -> p.bad to "模型未就绪 · 点击标题展开"
+    private fun renderPhase(phase: ModelPhase) {
+        val (color, label) = when (phase) {
+            ModelPhase.IMPORTING -> p.busy to "正在导入模型…"
+            ModelPhase.INITIALIZING -> p.busy to "正在初始化…"
+            ModelPhase.RELEASING -> p.busy to "正在释放…"
+            ModelPhase.GENERATING -> p.ok to "生成中…"
+            ModelPhase.READY -> p.ok to "模型就绪 · 离线运行"
+            ModelPhase.UNLOADED -> p.bad to "模型未就绪 · 点击标题展开"
         }
         (statusDot.background as GradientDrawable).setColor(color)
         statusSubtitle.text = label
-        emptyHint.text = if (state == MnnLlm.State.READY || state == MnnLlm.State.GENERATING)
+        emptyHint.text = if (phase == ModelPhase.READY || phase == ModelPhase.GENERATING)
             "输入问题，开始对话" else "点击上方「LocalAI ▾」，导入并初始化模型"
+
+        // 按钮可用性完全由阶段推导
+        val unloaded = phase == ModelPhase.UNLOADED
+        importButton.isEnabled = unloaded
+        initButton.isEnabled = unloaded
+        releaseButton.isEnabled = phase == ModelPhase.READY || phase == ModelPhase.GENERATING
+        sendButton.isEnabled = phase == ModelPhase.READY
+        stopButton.isEnabled = phase == ModelPhase.GENERATING   // 同时负责"发送/停止"互换显示
+
+        // 面板自动展开/收起只在阶段发生变化时触发；Activity 重建后的首次渲染不动面板
+        val previous = lastPhase
+        lastPhase = phase
+        if (previous != null && previous != phase) {
+            when {
+                previous == ModelPhase.INITIALIZING && phase == ModelPhase.READY -> setPanelExpanded(false)
+                phase == ModelPhase.UNLOADED -> setPanelExpanded(true)   // 初始化失败 / 释放完成
+            }
+        }
     }
 
-    private fun setPanelExpanded(expanded: Boolean) {
+    private fun renderModelFiles(state: ModelFilesState) {
+        val lines = mutableListOf("模型目录：", state.dirPath, "", "必需文件：")
+        state.files.forEach {
+            lines += if (it.present) "✓ ${it.name}（${it.sizeBytes} bytes）" else "✗ ${it.name}：缺失"
+        }
+        fileStatusView.text = lines.joinToString("\n")
+    }
+
+    /** 增量同步：消息列表是已渲染列表的延伸时只新增/追加；否则（清空、释放）整体重建。 */
+    private fun renderMessages(list: List<ChatMessage>) {
+        val renderedIds = bubbleViews.keys.toList()
+        val isExtension = renderedIds.size <= list.size &&
+            renderedIds.indices.all { renderedIds[it] == list[it].id }
+        if (!isExtension) {
+            chatContainer.removeAllViews()
+            bubbleViews.clear()
+        }
+        for (msg in list) {
+            val view = bubbleViews.getOrPut(msg.id) {
+                when (msg.role) {
+                    ChatRole.USER -> addUserBubble(msg.text)
+                    ChatRole.ASSISTANT -> addAssistantBubble()
+                }
+            }
+            bindBubble(view, msg)
+        }
+        updateEmptyState()
+        if (stickToBottom) scrollToBottom()
+    }
+
+    private fun bindBubble(view: TextView, msg: ChatMessage) {
+        val shown = view.length()
+        if (msg.text.length > shown) {
+            view.append(msg.text, shown, msg.text.length)      // 流式：只追加新增部分
+        } else if (msg.text.length < shown) {
+            view.text = msg.text
+        }
+        if (msg.role == ChatRole.ASSISTANT) {
+            view.hint = if (msg.isStreaming) "思考中…" else "（无输出）"
+            // 流式输出期间不开选择，结束后再允许复制
+            val selectable = !msg.isStreaming
+            if (view.isTextSelectable != selectable) view.setTextIsSelectable(selectable)
+        }
+    }
+
+    // =====================================================================
+    //  界面辅助：面板 / 气泡 / 滚动
+    // =====================================================================
+    private fun setPanelExpanded(expanded: Boolean, animate: Boolean = true) {
         panelExpanded = expanded
-        TransitionManager.beginDelayedTransition(rootLayout)
+        if (animate) TransitionManager.beginDelayedTransition(rootLayout)
         panelScroll.visibility = if (expanded) View.VISIBLE else View.GONE
         chevronView.text = if (expanded) "▴" else "▾"
     }
@@ -387,7 +493,7 @@ class MainActivity : Activity() {
         emptyState.visibility = if (chatContainer.childCount == 0) View.VISIBLE else View.GONE
     }
 
-    private fun addUserBubble(text: String) {
+    private fun addUserBubble(text: String): TextView {
         val bubble = TextView(this).apply {
             this.text = text
             textSize = 16f
@@ -402,6 +508,7 @@ class MainActivity : Activity() {
             gravity = Gravity.END
             topMargin = dp(16)
         })
+        return bubble
     }
 
     /** 模型回答：不套气泡，直接铺正文，行距舒适；首个 token 到来前显示"思考中…" */
@@ -426,11 +533,6 @@ class MainActivity : Activity() {
     // 不用 fullScroll()：它可能把焦点从输入框抢走，导致键盘收起
     private fun scrollToBottom() {
         outputScroll.post { outputScroll.scrollTo(0, chatContainer.bottom) }
-    }
-
-    private fun warn(message: String) {
-        appendEvent(message)
-        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
     }
 
     // =====================================================================
@@ -528,269 +630,6 @@ class MainActivity : Activity() {
         }
     }
 
-    // =====================================================================
-    //  业务逻辑（函数签名与行为保持不变；仅在界面相关处补充了状态刷新）
-    // =====================================================================
-    private fun refreshModelStatus() {
-        val lines = mutableListOf(
-            "模型目录：",
-            modelDir.absolutePath,
-            "",
-            "必需文件："
-        )
-        requiredModelFiles.forEach { name ->
-            val modelFile = File(modelDir, name)
-            lines += if (modelFile.isFile && modelFile.length() > 0L) {
-                "✓ $name（${modelFile.length()} bytes）"
-            } else {
-                "✗ $name：缺失"
-            }
-        }
-        fileStatusView.text = lines.joinToString("\n")
-        if (!modelDir.exists()) modelDir.mkdirs()
-    }
-
-    private fun chooseModelFolder() {
-        if (importing) return
-        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
-        }
-        startActivityForResult(intent, REQUEST_MODEL_FOLDER)
-    }
-
-    @Deprecated("Uses the platform document-tree picker for broad Android compatibility.")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != REQUEST_MODEL_FOLDER || resultCode != RESULT_OK) return
-        val treeUri = data?.data ?: return
-        val flags = (data.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION) or
-            (data.flags and Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-        runCatching {
-            contentResolver.takePersistableUriPermission(treeUri, flags)
-        }.onFailure {
-            appendEvent("无法保留文件夹读取权限：${it.message}")
-        }
-        importModelFolder(treeUri)
-    }
-
-    private fun importModelFolder(treeUri: Uri) {
-        importing = true
-        importButton.isEnabled = false
-        initButton.isEnabled = false
-        sendButton.isEnabled = false
-        appendEvent("正在导入模型文件。llm.mnn.weight 较大，请保持 App 在前台并等待复制完成……")
-
-        uiScope.launch {
-            val result = withContext(Dispatchers.IO) {
-                runCatching { copyModelFiles(treeUri) }
-            }
-            importing = false
-            importButton.isEnabled = true
-            initButton.isEnabled = true
-            result.fold(
-                onSuccess = { copied ->
-                    refreshModelStatus()
-                    appendEvent("导入完成：${copied.joinToString(", ").ifEmpty { "没有找到可导入的模型文件" }}")
-                    val missing = requiredModelFiles.filter { !File(modelDir, it).isFile || File(modelDir, it).length() == 0L }
-                    if (missing.isEmpty()) {
-                        appendEvent("必需文件已齐全。现在可以点击“初始化”。")
-                    } else {
-                        appendEvent("仍缺少：${missing.joinToString(", ")}。请确认选择的是直接包含 config.json 的文件夹。")
-                    }
-                },
-                onFailure = { error ->
-                    refreshModelStatus()
-                    appendEvent("导入失败：${error.message ?: error.javaClass.simpleName}")
-                }
-            )
-        }
-    }
-
-    private fun copyModelFiles(treeUri: Uri): List<String> {
-        val sourceFolder = DocumentFile.fromTreeUri(this, treeUri)
-            ?: throw IllegalStateException("无法读取所选文件夹")
-        if (!sourceFolder.isDirectory) throw IllegalArgumentException("请选择解压后的模型文件夹，而不是单个文件")
-
-        modelDir.mkdirs()
-        val copied = mutableListOf<String>()
-        (requiredModelFiles + optionalModelFiles).forEach { name ->
-            val source = sourceFolder.findFile(name) ?: return@forEach
-            if (!source.isFile) return@forEach
-            val destination = File(modelDir, name)
-            val temporary = File(modelDir, "$name.importing")
-            contentResolver.openInputStream(source.uri)?.use { input ->
-                FileOutputStream(temporary).use { output ->
-                    input.copyTo(output, 64 * 1024)
-                    output.fd.sync()
-                }
-            } ?: throw IllegalStateException("无法读取文件：$name")
-
-            if (destination.exists() && !destination.delete()) {
-                temporary.delete()
-                throw IllegalStateException("无法替换旧文件：$name")
-            }
-            if (!temporary.renameTo(destination)) {
-                temporary.delete()
-                throw IllegalStateException("无法保存文件：$name")
-            }
-            copied += name
-        }
-        return copied
-    }
-
-    private fun initializeModel() {
-        if (importing) {
-            appendEvent("模型文件正在导入，请稍候。")
-            return
-        }
-        if (llm != null) {
-            appendEvent("模型对象已存在；如需重新初始化，请先释放模型。")
-            return
-        }
-        val missing = requiredModelFiles.filter { !File(modelDir, it).isFile || File(modelDir, it).length() == 0L }
-        if (missing.isNotEmpty()) {
-            appendEvent("无法初始化，缺少文件：${missing.joinToString(", ")}")
-            refreshModelStatus()
-            return
-        }
-
-        initButton.isEnabled = false
-        importButton.isEnabled = false
-        sendButton.isEnabled = false
-        appendEvent("正在加载 MNN 原生库并初始化模型……")
-        val engine = MnnLlm(applicationContext)
-        llm = engine
-        uiScope.launch {
-            val result = engine.init(
-                modelDir = modelDir,
-                threads = 4,
-                backend = "cpu",
-                precision = "low",
-                maxNewTokens = LlmDefaults.MAX_NEW_TOKENS,
-                maxAllTokens = LlmDefaults.MAX_ALL_TOKENS,
-                systemPrompt = AdvisorPrompt.DEFAULT
-            )
-            result.fold(
-                onSuccess = {
-                    appendEvent("✓ 模型初始化成功。现在可以输入问题并点击发送。")
-                    sendButton.isEnabled = true
-                    stopButton.isEnabled = false
-                    releaseButton.isEnabled = true
-                    initButton.isEnabled = false
-                    importButton.isEnabled = false
-                    setPanelExpanded(false)          // 就绪后收起面板，让出对话空间
-                },
-                onFailure = { error ->
-                    appendEvent("初始化失败：${error.message ?: error.javaClass.simpleName}")
-                    llm = null
-                    engine.release()
-                    initButton.isEnabled = true
-                    importButton.isEnabled = true
-                    refreshModelStatus()
-                    setPanelExpanded(true)           // 失败时展开面板，方便查看日志
-                }
-            )
-        }
-        updateStatus()   // launch 内的 init 已同步进入 INITIALIZING，这里立即刷新状态灯
-    }
-
-    private fun sendPrompt() {
-        val engine = llm
-        if (engine == null || !engine.isReady) {
-            warn("模型尚未成功初始化，因此发送暂不可用。请先初始化模型。")
-            sendButton.isEnabled = false
-            setPanelExpanded(true)
-            return
-        }
-        val prompt = promptInput.text.toString().trim()
-        if (prompt.isEmpty()) {
-            warn("请先输入问题。")
-            return
-        }
-
-        sendButton.isEnabled = false
-        stopButton.isEnabled = true
-        promptInput.setText("")
-        addUserBubble(prompt)
-        val bubble = addAssistantBubble()
-        outputView = bubble
-        bubble.text = ""
-        updateEmptyState()
-        stickToBottom = true
-        scrollToBottom()
-        appendEvent("开始生成……")
-        uiScope.launch {
-            try {
-                engine.chat(prompt).collect { piece ->
-                    bubble.append(piece)
-                    if (stickToBottom) scrollToBottom()
-                }
-                appendEvent("生成结束：${engine.lastFinishReason ?: "未知原因"}")
-                if (engine.lastFinishReason == FinishReason.MAX_TOKENS) bubble.append("\n\n…（已达到长度上限）")
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Throwable) {
-                warn("生成失败：${error.message ?: error.javaClass.simpleName}")
-            } finally {
-                sendButton.isEnabled = engine.isReady
-                stopButton.isEnabled = false
-                if (bubble.text.isEmpty()) bubble.hint = "（无输出）"
-                bubble.setTextIsSelectable(true)     // 流式输出期间不开选择，结束后再允许复制
-                updateStatus()
-            }
-        }
-    }
-
-    private fun releaseModel() {
-        val engine = llm ?: return
-        sendButton.isEnabled = false
-        stopButton.isEnabled = false
-        releaseButton.isEnabled = false
-        appendEvent("正在释放模型资源……")
-        engine.release()
-        updateStatus()
-        uiScope.launch {
-            runCatching { engine.awaitReleased() }
-            if (llm === engine) llm = null
-            chatContainer.removeAllViews()           // 模型上下文已销毁，界面上的旧对话一并清掉
-            updateEmptyState()
-            appendEvent("模型资源已释放。")
-            initButton.isEnabled = true
-            importButton.isEnabled = true
-            refreshModelStatus()
-            setPanelExpanded(true)
-        }
-    }
-
-    /** 新增：清空界面对话与模型端的对话历史（MnnLlm.reset） */
-    private fun startNewChat() {
-        if (stopButton.isEnabled) {
-            Toast.makeText(this, "请先停止当前生成", Toast.LENGTH_SHORT).show()
-            return
-        }
-        chatContainer.removeAllViews()
-        updateEmptyState()
-        val engine = llm ?: return
-        if (!engine.isReady) return
-        uiScope.launch {
-            try {
-                engine.reset()
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Throwable) {
-                appendEvent("清空上下文失败：${error.message ?: error.javaClass.simpleName}")
-            }
-        }
-    }
-
-    private fun appendEvent(message: String) {
-        // 只保留最近 16 行，避免日志无限增长；状态灯随事件同步刷新
-        val lines = (eventStatusView.text.toString() + "\n" + message).lines().takeLast(16)
-        eventStatusView.text = lines.joinToString("\n")
-        updateStatus()
-    }
-
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density + 0.5f).toInt()
 
     private fun dpf(value: Float): Float = value * resources.displayMetrics.density
@@ -798,11 +637,4 @@ class MainActivity : Activity() {
     private fun matchWrap() = LinearLayout.LayoutParams(MATCH, WRAP)
 
     private fun wrapWrap() = LinearLayout.LayoutParams(WRAP, WRAP)
-
-    override fun onDestroy() {
-        llm?.release()
-        llm = null
-        uiScope.cancel()
-        super.onDestroy()
-    }
 }
