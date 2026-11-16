@@ -1,6 +1,7 @@
 package com.seankew.localai
 
 import android.app.Application
+import android.content.Context
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
@@ -8,16 +9,28 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import com.seankew.localai.memory.ArchivistDB
+import com.seankew.localai.memory.CognitiveMemoryManager
+import com.seankew.localai.memory.ExplicitResult
+import com.seankew.localai.memory.MemoryRecord
+import com.seankew.localai.memory.ReflectionGate
+import com.seankew.localai.memory.ReflectionLlm
+import com.seankew.localai.memory.RoomMemoryStore
+import com.seankew.localai.memory.UpsertKind
 import java.io.File
 import java.io.FileOutputStream
 import kotlin.coroutines.coroutineContext
@@ -70,6 +83,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         const val MAX_EVENT_LINES = 16
         const val INITIAL_EVENT = "先导入模型文件，再初始化。"
 
+        const val PREFS_NAME = "localai_prefs"
+        const val KEY_MEMORY_ENABLED = "memory_enabled"
+        const val KEY_LEARNING_ENABLED = "learning_enabled"
+
+        /** 回答结束后等多久再开始后台反思：给界面收尾、也给用户紧接着追问留出时间（追问会立刻打断反思）。 */
+        const val REFLECTION_DELAY_MS = 2_000L
+
         val REQUIRED_MODEL_FILES = listOf(
             "config.json",
             "llm_config.json",
@@ -110,6 +130,34 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var importing = false
     private var generationJob: Job? = null
     private var nextMessageId = 0L
+
+    // ---------------------------------------------------------------- 认知记忆（长时记忆 + 本地 RAG + 自学习）
+    private val prefs = app.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    /** 延迟创建：Room 数据库在第一次真正查询时才会在后台线程打开。 */
+    private val memory: CognitiveMemoryManager by lazy {
+        CognitiveMemoryManager(
+            store = RoomMemoryStore(ArchivistDB.get(app).memoryDao()),
+            log = { logEvent("🧠 $it") },
+        )
+    }
+
+    private val _memoryEnabled = MutableStateFlow(prefs.getBoolean(KEY_MEMORY_ENABLED, true))
+    /** 总开关：关闭后既不检索注入，也不学习，行为与没有记忆系统时完全一致。 */
+    val memoryEnabled: StateFlow<Boolean> = _memoryEnabled.asStateFlow()
+
+    private val _learningEnabled = MutableStateFlow(prefs.getBoolean(KEY_LEARNING_ENABLED, true))
+    /** 自学习开关：关闭后只使用已有记忆（以及用户明确说"记住……"），不再后台反思。 */
+    val learningEnabled: StateFlow<Boolean> = _learningEnabled.asStateFlow()
+
+    /** 记忆库内容，仅在界面可见期间订阅数据库。 */
+    val memories: StateFlow<List<MemoryRecord>> by lazy {
+        memory.observeAll().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+    }
+
+    private var reflectionJob: Job? = null
+    /** 后台反思正在占用模型：此时引擎内部状态是 GENERATING，但对界面应当保持 READY（"静默"）。 */
+    private var reflecting = false
 
     val modelDir: File
         get() = File(app.getExternalFilesDir(null) ?: app.filesDir, MODEL_DIR_NAME)
@@ -249,6 +297,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (_phase.value == ModelPhase.RELEASING) return
         _phase.value = ModelPhase.RELEASING
         logEvent("正在释放模型资源……")
+        reflectionJob?.cancel()
         engine.release()                              // 非阻塞；会请求停止在途推理
         viewModelScope.launch {
             runCatching { engine.awaitReleased() }
@@ -270,7 +319,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun sendMessage(text: String): Boolean {
         val engine = llm
-        if (engine == null || !engine.isReady || _phase.value != ModelPhase.READY) {
+        // 注意：后台反思期间引擎内部是 GENERATING，但 phase 仍是 READY；这里以 phase 为准，发送时会先打断反思
+        if (engine == null || _phase.value != ModelPhase.READY) {
             warn("模型尚未成功初始化，因此发送暂不可用。请先初始化模型。")
             return false
         }
@@ -289,9 +339,24 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         logEvent("开始生成……")
 
         generationJob = viewModelScope.launch {
+            val answer = StringBuilder()
             try {
+                // 1) 用户优先：打断后台学习，并等 native 真正退出后再开始聊天
+                reflectionJob?.cancelAndJoin()
+
+                // 2) 记忆：处理"记住……"指令 + 检索相关记忆拼进系统提示词。
+                //    记忆层任何失败都只会退回默认提示词，不会影响聊天。
+                var systemOverride: String? = null
+                if (_memoryEnabled.value) {
+                    handleExplicitMemory(prompt)
+                    val composed = memory.composeSystemPrompt(AdvisorPrompt.DEFAULT, prompt)
+                    systemOverride = composed.systemPrompt
+                    if (composed.used.isNotEmpty()) logEvent("🧠 本轮参考了 ${composed.used.size} 条记忆")
+                }
+
                 // chat() 的 callbackFlow 逻辑保持不变：本协程被取消 = 中断 native 推理
-                engine.chat(prompt).collect { piece ->
+                engine.chat(prompt, systemPromptOverride = systemOverride).collect { piece ->
+                    answer.append(piece)
                     updateMessage(assistantId) { it.copy(text = it.text + piece) }
                 }
                 val reason = engine.lastFinishReason
@@ -299,6 +364,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 if (reason == FinishReason.MAX_TOKENS) {
                     updateMessage(assistantId) { it.copy(text = it.text + "\n\n…（已达到长度上限）") }
                 }
+
+                // 3) 学习：只对"顺利结束"的回答做静默反思（用户中途点了停止则跳过）
+                if (reason != FinishReason.STOPPED) scheduleReflection(engine, prompt, answer.toString())
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Throwable) {
@@ -320,7 +388,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         logEvent("已请求停止生成。")
     }
 
-    /** 清空界面对话与模型端对话历史。 */
+    /** 清空界面对话与模型端对话历史；若静默反思正在运行，先取消并等待 native 推理退出。 */
     fun newChat() {
         if (_phase.value == ModelPhase.GENERATING) {
             toastChannel.trySend("请先停止当前生成")
@@ -328,6 +396,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         _messages.value = emptyList()
         val engine = llm ?: return
+        val pendingReflection = reflectionJob
+        if (pendingReflection != null) {
+            viewModelScope.launch {
+                try {
+                    pendingReflection.cancelAndJoin()
+                    if (reflectionJob === pendingReflection) reflectionJob = null
+                    if (llm !== engine || !engine.isReady) return@launch
+                    engine.reset()
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Throwable) {
+                    logEvent("清空上下文失败：${error.message ?: error.javaClass.simpleName}")
+                }
+            }
+            return
+        }
         if (!engine.isReady) return
         viewModelScope.launch {
             try {
@@ -336,6 +420,82 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 throw cancelled
             } catch (error: Throwable) {
                 logEvent("清空上下文失败：${error.message ?: error.javaClass.simpleName}")
+            }
+        }
+    }
+
+    // ====================================================================
+    //  认知记忆
+    // ====================================================================
+
+    private suspend fun handleExplicitMemory(userText: String) {
+        when (val result = memory.rememberExplicit(userText)) {
+            null -> Unit
+            is ExplicitResult.Saved -> logEvent("🧠 已记住：${result.result.record.content}")
+            is ExplicitResult.Rejected -> warn("这条内容没有写入长期记忆：${result.reason}")
+        }
+    }
+
+    /**
+     * 回答结束后的静默反思。只在"像是包含值得记住的信息"时才触发（省电），
+     * 并且用户一发新消息就会被 [sendMessage] 取消 —— 聊天永远优先于学习。
+     */
+    private fun scheduleReflection(engine: MnnLlm, userText: String, answer: String) {
+        if (!_memoryEnabled.value || !_learningEnabled.value) return
+        if (!ReflectionGate.shouldReflect(userText, answer)) return
+
+        reflectionJob?.cancel()
+        reflectionJob = viewModelScope.launch {
+            try {
+                delay(REFLECTION_DELAY_MS)
+                if (_phase.value != ModelPhase.READY || llm !== engine) return@launch
+                reflecting = true
+                val reflector = ReflectionLlm { system, user, maxTokens ->
+                    engine.complete(system, user, maxTokens).getOrNull()
+                }
+                val outcome = memory.reflect(reflector, userText, answer)
+                for (item in outcome.results) {
+                    when (item.kind) {
+                        UpsertKind.ADDED -> logEvent("🧠 已记住：${item.record.content}")
+                        UpsertKind.MERGED -> logEvent("🧠 已更新记忆：${item.record.content}")
+                        UpsertKind.REINFORCED -> Unit   // 重复出现的旧记忆：静默强化，不打扰
+                    }
+                }
+            } finally {
+                reflecting = false
+            }
+        }
+    }
+
+    fun setMemoryEnabled(enabled: Boolean) {
+        _memoryEnabled.value = enabled
+        prefs.edit().putBoolean(KEY_MEMORY_ENABLED, enabled).apply()
+        if (!enabled) reflectionJob?.cancel()
+    }
+
+    fun setLearningEnabled(enabled: Boolean) {
+        _learningEnabled.value = enabled
+        prefs.edit().putBoolean(KEY_LEARNING_ENABLED, enabled).apply()
+        if (!enabled) reflectionJob?.cancel()
+    }
+
+    fun deleteMemory(id: Long) = launchMemoryOp("删除记忆") { memory.delete(id) }
+
+    fun clearMemories() = launchMemoryOp("清空记忆") {
+        memory.clear()
+        logEvent("🧠 已清空全部长期记忆。")
+    }
+
+    fun setMemoryPinned(id: Long, pinned: Boolean) = launchMemoryOp("更新置顶") { memory.setPinned(id, pinned) }
+
+    private fun launchMemoryOp(what: String, block: suspend () -> Unit) {
+        viewModelScope.launch {
+            try {
+                block()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                warn("$what 失败：${error.message ?: error.javaClass.simpleName}")
             }
         }
     }
@@ -371,7 +531,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 null, MnnLlm.State.NEW, MnnLlm.State.FAILED, MnnLlm.State.RELEASED -> ModelPhase.UNLOADED
                 MnnLlm.State.INITIALIZING -> ModelPhase.INITIALIZING
                 MnnLlm.State.READY -> ModelPhase.READY
-                MnnLlm.State.GENERATING -> ModelPhase.GENERATING
+                MnnLlm.State.GENERATING -> if (reflecting) ModelPhase.READY else ModelPhase.GENERATING
                 MnnLlm.State.RELEASING -> ModelPhase.RELEASING
             }
         }

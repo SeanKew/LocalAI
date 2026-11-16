@@ -1,5 +1,6 @@
 package com.seankew.localai
 
+import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
@@ -31,6 +32,7 @@ import androidx.activity.viewModels
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import com.seankew.localai.memory.MemoryRecord
 import kotlinx.coroutines.launch
 
 private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
@@ -118,6 +120,11 @@ class MainActivity : ComponentActivity() {
     private lateinit var sendButton: Button
     private lateinit var stopButton: Button
     private lateinit var releaseButton: Button
+    private lateinit var memoryCountView: TextView
+    private lateinit var memoryToggle: Button
+    private lateinit var learnToggle: Button
+    private lateinit var manageMemoryButton: Button
+    private var memoryDialog: AlertDialog? = null
 
     private val pickModelFolder =
         registerForActivityResult(PersistableOpenDocumentTree()) { uri ->
@@ -163,6 +170,14 @@ class MainActivity : ComponentActivity() {
                 launch { vm.messages.collect { renderMessages(it) } }
                 launch { vm.events.collect { eventStatusView.text = it.joinToString("\n") } }
                 launch { vm.modelFiles.collect { renderModelFiles(it) } }
+                launch {
+                    vm.memoryEnabled.collect {
+                        memoryToggle.text = if (it) "记忆 · 开" else "记忆 · 关"
+                        learnToggle.isEnabled = it            // 总开关关闭时，自学习没有意义
+                    }
+                }
+                launch { vm.learningEnabled.collect { learnToggle.text = if (it) "自学习 · 开" else "自学习 · 关" } }
+                launch { vm.memories.collect { memoryCountView.text = "已保存 ${it.size} 条长期记忆" } }
                 launch {
                     vm.toasts.collect { Toast.makeText(this@MainActivity, it, Toast.LENGTH_SHORT).show() }
                 }
@@ -277,6 +292,24 @@ class MainActivity : ComponentActivity() {
             addView(initButton, LinearLayout.LayoutParams(0, dp(44), 1f).apply { rightMargin = dp(8) })
             addView(releaseButton, LinearLayout.LayoutParams(0, dp(44), 1f))
         }
+        memoryCountView = TextView(this).apply {
+            textSize = 12f
+            setTextColor(p.text)
+            text = "长期记忆：加载中…"
+        }
+        memoryToggle = pill("记忆 · 开", filled = false).apply {
+            setOnClickListener { vm.setMemoryEnabled(!vm.memoryEnabled.value) }
+        }
+        learnToggle = pill("自学习 · 开", filled = false).apply {
+            setOnClickListener { vm.setLearningEnabled(!vm.learningEnabled.value) }
+        }
+        manageMemoryButton = pill("管理记忆", filled = false).apply { setOnClickListener { showMemoryDialog() } }
+        val memoryRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(memoryToggle, LinearLayout.LayoutParams(0, dp(44), 1f).apply { rightMargin = dp(8) })
+            addView(learnToggle, LinearLayout.LayoutParams(0, dp(44), 1f).apply { rightMargin = dp(8) })
+            addView(manageMemoryButton, LinearLayout.LayoutParams(0, dp(44), 1f))
+        }
         eventStatusView = TextView(this).apply {
             textSize = 11.5f
             typeface = Typeface.MONOSPACE
@@ -291,6 +324,9 @@ class MainActivity : ComponentActivity() {
             addView(sectionLabel("模型文件"))
             addView(fileStatusView, matchWrap().apply { topMargin = dp(6) })
             addView(buttonRow, matchWrap().apply { topMargin = dp(14) })
+            addView(sectionLabel("长期记忆"), matchWrap().apply { topMargin = dp(16) })
+            addView(memoryCountView, matchWrap().apply { topMargin = dp(6) })
+            addView(memoryRow, matchWrap().apply { topMargin = dp(10) })
             addView(sectionLabel("运行日志"), matchWrap().apply { topMargin = dp(16) })
             addView(eventStatusView, matchWrap().apply { topMargin = dp(6) })
         }
@@ -396,6 +432,57 @@ class MainActivity : ComponentActivity() {
         applySystemBars()
         setPanelExpanded(true)      // 首次进入：先展开，引导导入并初始化模型
         updateEmptyState()
+    }
+
+    // =====================================================================
+    //  长期记忆管理：查看 / 置顶 / 删除 / 清空
+    //  自动学习难免记错，用户必须能看到并纠正 AI 记住了什么。
+    // =====================================================================
+    private fun showMemoryDialog() {
+        memoryDialog?.dismiss()
+        val items = vm.memories.value
+        if (items.isEmpty()) {
+            memoryDialog = AlertDialog.Builder(this)
+                .setTitle("长期记忆")
+                .setMessage("还没有记忆。\n你可以直接说“记住：……”，开启自学习后我也会从对话里整理。")
+                .setPositiveButton("好", null)
+                .show()
+            return
+        }
+        val labels = items.map { (if (it.pinned) "📌 " else "") + "[${it.kind.label}] ${it.content}" }.toTypedArray()
+        memoryDialog = AlertDialog.Builder(this)
+            .setTitle("长期记忆（${items.size}）")
+            .setItems(labels) { _, which -> showMemoryActions(items[which]) }
+            .setNegativeButton("关闭", null)
+            .setNeutralButton("清空") { _, _ -> confirmClearMemories() }
+            .show()
+    }
+
+    private fun showMemoryActions(record: MemoryRecord) {
+        memoryDialog?.dismiss()
+        memoryDialog = AlertDialog.Builder(this)
+            .setMessage(record.content)
+            .setPositiveButton("删除") { _, _ -> vm.deleteMemory(record.id) }
+            .setNeutralButton(if (record.pinned) "取消置顶" else "置顶（总是参考）") { _, _ ->
+                vm.setMemoryPinned(record.id, !record.pinned)
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun confirmClearMemories() {
+        memoryDialog?.dismiss()
+        memoryDialog = AlertDialog.Builder(this)
+            .setTitle("清空全部长期记忆？")
+            .setMessage("此操作不可撤销。")
+            .setPositiveButton("清空") { _, _ -> vm.clearMemories() }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    override fun onDestroy() {
+        memoryDialog?.dismiss()        // 旋转 / 退出时避免窗口泄漏
+        super.onDestroy()
     }
 
     // =====================================================================

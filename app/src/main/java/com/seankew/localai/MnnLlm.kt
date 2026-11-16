@@ -3,9 +3,11 @@ package com.seankew.localai
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.channels.Channel
@@ -132,8 +134,15 @@ class MnnLlm(private val context: Context) : AutoCloseable {
     /**
      * 同一时刻只允许一次生成；状态不是 READY 时 Flow 以 IllegalStateException 结束。
      * 取消收集（或调用 stop()）会真正中断 native 推理，通常在下一个 token 内生效。
+     *
+     * [systemPromptOverride] 只对这一轮生效（例如注入了长期记忆的系统提示词）；为 null 时使用默认系统提示词。
+     * 它不会写入对话历史，下一轮可以换成完全不同的内容。
      */
-    fun chat(userText: String, maxNewTokens: Int = defaultMaxNewTokens): Flow<String> = callbackFlow {
+    fun chat(
+        userText: String,
+        maxNewTokens: Int = defaultMaxNewTokens,
+        systemPromptOverride: String? = null,
+    ): Flow<String> = callbackFlow {
         require(maxNewTokens > 0) { "maxNewTokens must be > 0" }
         if (!state.compareAndSet(State.READY, State.GENERATING)) {
             close(IllegalStateException("MnnLlm is ${state.get()}; chat() requires READY"))
@@ -169,7 +178,7 @@ class MnnLlm(private val context: Context) : AutoCloseable {
                     lastFinishReason = FinishReason.STOPPED
                 } else {
                     history.trim(maxHistoryChars)
-                    val prompt = ChatMl.build(systemPrompt, history.snapshot(), userText)
+                    val prompt = ChatMl.build(systemPromptOverride ?: systemPrompt, history.snapshot(), userText)
                     Log.i(TAG, "chat: gen=$gen promptChars=${prompt.length} historyTurns=${history.size}")
 
                     val code = MnnNative.nativeGenerate(
@@ -201,6 +210,79 @@ class MnnLlm(private val context: Context) : AutoCloseable {
             runCatching { MnnNative.nativeStop(h, gen) }
         }
     }.buffer(Channel.UNLIMITED)
+    // ------------------------------------------------------------------ complete
+    /**
+     * 一次性、无状态的补全：不读取也不写入对话历史，不改变 [lastFinishReason]。用于后台"反思"等内部任务。
+     * native 的 nativeGenerate 每次开头都会 reset KV，因此不会污染聊天上下文，聊天也不会污染它。
+     *
+     * - 与 chat() 互斥：状态必须是 READY，否则立即返回失败（不排队）。
+     * - 被取消时会中断 native 推理，并**等 native 真正退出、状态回到 READY 之后**才继续抛出取消。
+     *   因此调用方 `job.cancelAndJoin()` 返回后，立刻调用 chat() 是安全的。
+     *   （注意：预填充阶段无法被打断，最坏情况下要等它跑完，所以内部任务的提示词要尽量短。）
+     * - 达到 maxNewTokens 视为成功（返回被截断的文本）；被 stop()/release() 打断视为失败。
+     */
+    suspend fun complete(system: String?, user: String, maxNewTokens: Int = 160): Result<String> {
+        require(maxNewTokens > 0) { "maxNewTokens must be > 0" }
+        if (!state.compareAndSet(State.READY, State.GENERATING)) {
+            return Result.failure(IllegalStateException("MnnLlm is ${state.get()}; complete() requires READY"))
+        }
+        val h = handle
+        val gen = genCounter.incrementAndGet()
+        val cancelled = AtomicBoolean(false)
+        activeGen = gen
+        activeCancel = cancelled
+        val out = StringBuilder()
+        val done = CompletableDeferred<Result<String>>()
+
+        val cb = TokenCallback { bytes ->
+            try {
+                if (cancelled.get() || state.get() != State.GENERATING) {
+                    false
+                } else {
+                    out.append(String(bytes, Charsets.UTF_8))
+                    true
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "complete token callback failed", t)
+                false
+            }
+        }
+
+        val job = llmScope.launch {
+            val result: Result<String> = try {
+                if (cancelled.get() || state.get() != State.GENERATING) {
+                    Result.failure(IllegalStateException("complete() stopped before start"))
+                } else {
+                    val prompt = ChatMl.build(system, emptyList(), user)
+                    Log.i(TAG, "complete: gen=$gen promptChars=${prompt.length}")
+                    val code = MnnNative.nativeGenerate(h, gen, prompt.toByteArray(Charsets.UTF_8), maxNewTokens, cb)
+                    if (code == 1) Result.failure(IllegalStateException("complete() stopped"))
+                    else Result.success(out.toString())
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "complete failed: ${t.message}", t)
+                Result.failure(t)
+            } finally {
+                if (activeGen == gen) { activeGen = 0L; activeCancel = null }
+                state.compareAndSet(State.GENERATING, State.READY)
+            }
+            done.complete(result)
+        }
+        // 兜底：如果 llm 调度器已关闭导致协程根本没跑起来，也要让调用方醒来，而不是永远挂起
+        job.invokeOnCompletion { cause ->
+            if (!done.isCompleted) done.complete(Result.failure(cause ?: IllegalStateException("llm scope closed")))
+        }
+
+        return try {
+            done.await()
+        } catch (e: CancellationException) {
+            cancelled.set(true)
+            runCatching { MnnNative.nativeStop(h, gen) }
+            withContext(NonCancellable) { done.await() }   // 等 native 真正退出、状态回到 READY
+            throw e
+        }
+    }
+
     /** 请求停止当前生成（非阻塞，线程安全）。 */
     fun stop() {
         val h = handle
