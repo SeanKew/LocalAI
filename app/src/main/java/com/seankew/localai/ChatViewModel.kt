@@ -155,6 +155,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         memory.observeAll().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
     }
 
+    /** 记忆库不可用的原因（数据库损坏 / 缺少迁移等）；正常为 null。界面据此显示提示而不是误导性的"0 条记忆"。 */
+    val memoryStoreError: StateFlow<String?> get() = memory.storeError
+
     private var reflectionJob: Job? = null
     /** 后台反思正在占用模型：此时引擎内部状态是 GENERATING，但对界面应当保持 READY（"静默"）。 */
     private var reflecting = false

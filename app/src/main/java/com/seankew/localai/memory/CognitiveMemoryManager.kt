@@ -2,6 +2,13 @@ package com.seankew.localai.memory
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.onEach
 
 /** 反思所需的最小 LLM 能力。生产环境由 MnnLlm.complete 适配，测试里用假实现。 */
 fun interface ReflectionLlm {
@@ -172,7 +179,28 @@ class CognitiveMemoryManager(
     }
 
     // ------------------------------------------------------------------ 管理
-    fun observeAll(): Flow<List<MemoryRecord>> = store.observeAll()
+    private val _storeError = MutableStateFlow<String?>(null)
+
+    /**
+     * 记忆库当前不可用的原因（数据库损坏、缺少迁移、磁盘错误等）；正常时为 null。
+     * 只反映 [observeAll] 这条观察流的状态：界面一启动就会订阅它，所以最先暴露问题；收到下一次成功数据后自动清除。
+     */
+    val storeError: StateFlow<String?> = _storeError.asStateFlow()
+
+    /**
+     * 观察全部记忆。**这条流永远不会抛异常**：数据库打不开 / 缺少迁移 / 中途出错时，
+     * 记录原因到 [storeError]，发出一个空列表后正常结束 —— 否则异常会一路冒泡成应用启动即崩溃。
+     * 取消（界面离开）不算错误，照常传播。下次重新订阅时会重试。
+     */
+    fun observeAll(): Flow<List<MemoryRecord>> =
+        flow { emitAll(store.observeAll()) }   // 在 flow 内部取 store.observeAll()，连同步抛出的异常也一并兜住
+            .onEach { _storeError.value = null }
+            .catch { error ->
+                val reason = error.message ?: error.javaClass.simpleName
+                _storeError.value = reason
+                log("记忆库不可用：$reason")
+                emit(emptyList())
+            }
     suspend fun delete(id: Long) = store.delete(id)
     suspend fun clear() = store.clear()
     suspend fun setPinned(id: Long, pinned: Boolean) = store.setPinned(id, pinned, clock())

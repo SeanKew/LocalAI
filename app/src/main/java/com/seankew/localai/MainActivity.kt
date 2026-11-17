@@ -125,6 +125,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var learnToggle: Button
     private lateinit var manageMemoryButton: Button
     private var memoryDialog: AlertDialog? = null
+    private var memoryTotal = 0
+    private var memoryError: String? = null
 
     private val pickModelFolder =
         registerForActivityResult(PersistableOpenDocumentTree()) { uri ->
@@ -177,7 +179,8 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 launch { vm.learningEnabled.collect { learnToggle.text = if (it) "自学习 · 开" else "自学习 · 关" } }
-                launch { vm.memories.collect { memoryCountView.text = "已保存 ${it.size} 条长期记忆" } }
+                launch { vm.memories.collect { memoryTotal = it.size; renderMemoryCount() } }
+                launch { vm.memoryStoreError.collect { memoryError = it; renderMemoryCount() } }
                 launch {
                     vm.toasts.collect { Toast.makeText(this@MainActivity, it, Toast.LENGTH_SHORT).show() }
                 }
@@ -438,6 +441,12 @@ class MainActivity : ComponentActivity() {
     //  长期记忆管理：查看 / 置顶 / 删除 / 清空
     //  自动学习难免记错，用户必须能看到并纠正 AI 记住了什么。
     // =====================================================================
+    private fun renderMemoryCount() {
+        val error = memoryError
+        memoryCountView.text = if (error == null) "已保存 $memoryTotal 条长期记忆" else "长期记忆：记忆库不可用（${error.take(60)}）"
+        manageMemoryButton.isEnabled = error == null     // 库不可用时不允许进入管理，避免误导
+    }
+
     private fun showMemoryDialog() {
         memoryDialog?.dismiss()
         val items = vm.memories.value

@@ -1,3 +1,8 @@
+import org.gradle.api.tasks.InputDirectory
+import org.gradle.api.tasks.PathSensitive
+import org.gradle.api.tasks.PathSensitivity
+import org.gradle.process.CommandLineArgumentProvider
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -40,6 +45,22 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
 }
+// 导出 Room schema（JSON）：为以后的 AutoMigration / 迁移测试保留每个版本的表结构历史。
+// 不使用 Room Gradle 插件：插件会按构建变体写出 schemas/debug/... 与 schemas/release/... 两份，
+// 路径随变体变化，不利于 CI 守卫；这里固定输出到 app/schemas/<数据库类全名>/<版本>.json。
+class RoomSchemaArgProvider(
+    @get:InputDirectory
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    val schemaDir: File,
+) : CommandLineArgumentProvider {
+    override fun asArguments(): Iterable<String> = listOf("room.schemaLocation=${schemaDir.path}")
+}
+
+ksp {
+    // @InputDirectory 要求目录必须存在，首次构建前先创建
+    arg(RoomSchemaArgProvider(File(projectDir, "schemas").also { it.mkdirs() }))
+}
+
 dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("androidx.documentfile:documentfile:1.0.1")
